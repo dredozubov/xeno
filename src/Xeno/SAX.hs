@@ -11,6 +11,18 @@ module Xeno.SAX
   , fold
   , validate
   , dump
+  , elemIndexFrom
+  , substring
+  , s_index
+  , openTagChar
+  , closeTagChar
+  , bangChar
+  , commentChar
+  , openAngleBracketChar
+  , closeAngleBracketChar
+  , slashChar
+  , questionChar
+  , slashChar
   ) where
 
 import           Control.Exception

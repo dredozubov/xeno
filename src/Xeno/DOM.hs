@@ -26,7 +26,7 @@ import           Data.STRef
 import           Data.Vector.Unboxed ((!))
 import qualified Data.Vector.Unboxed as UV
 import qualified Data.Vector.Unboxed.Mutable as UMV
-import           Xeno.SAX
+import           Xeno.SAX hiding (substring)
 import           Xeno.Types
 
 -- | Some XML nodes.
