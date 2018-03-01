@@ -27,12 +27,14 @@ library
   hs-source-dirs: src
   ghc-options: -Wall -O2
   exposed-modules: Xeno.SAX
+                 , Xeno.Consumer
                  , Xeno.DOM
                  , Xeno.Streaming
                  , Xeno.Types
   other-modules: Control.Spork
   build-depends: base >= 4.7 && < 5
                , bytestring
+               , containers
                , vector
                , deepseq
                , array

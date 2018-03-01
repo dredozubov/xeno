@@ -14,6 +14,8 @@ module Xeno.SAX
   , elemIndexFrom
   , substring
   , s_index
+  , parseName
+  , skipSpaces
   , openTagChar
   , closeTagChar
   , bangChar
@@ -22,7 +24,9 @@ module Xeno.SAX
   , closeAngleBracketChar
   , slashChar
   , questionChar
-  , slashChar
+  , equalChar
+  , quoteChar
+  , doubleQuoteChar
   ) where
 
 import           Control.Exception

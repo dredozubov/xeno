@@ -16,8 +16,7 @@ main = hspec spec
 
 spec :: SpecWith ()
 spec =
-  describe
-    "hexml tests"
+  describe "hexml tests"
     (do mapM_
           (\(v, i) -> it (show i) (shouldBe (Xeno.SAX.validate i) v))
           (hexml_examples_sax  ++ extra_examples_sax)
