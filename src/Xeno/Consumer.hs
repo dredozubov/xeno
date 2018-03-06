@@ -1,14 +1,20 @@
+{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE GADTs #-}
 {-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TupleSections #-}
+{-# LANGUAGE ViewPatterns #-}
 {-# LANGUAGE UndecidableInstances #-}
 
 module Xeno.Consumer where
 
+import           Control.Monad.Cont
 import           Control.Monad.Except
 import           Data.ByteString
+import           Data.Coerce
 import           Data.Function
 import           Debug.Trace
 import           Streaming
@@ -17,54 +23,57 @@ import           Xeno.Streaming
 
 
 type Transitions m r
-  =  (ByteString -> Maybe TagState -> r -> m (Maybe TagState, r))
-  -> (ByteString -> ByteString -> Maybe TagState -> r -> m (Maybe TagState, r))
-  -> (ByteString -> Maybe TagState -> r -> m (Maybe TagState, r))
-  -> (ByteString -> Maybe TagState -> r -> m (Maybe TagState, r))
-  -> (ByteString -> Maybe TagState -> r -> m (Maybe TagState, r))
-  -> (ByteString -> Maybe TagState -> r -> m (Maybe TagState, r))
+  =  (ByteString -> Handler m r)
+  -> (ByteString -> ByteString -> Handler m r)
+  -> (ByteString -> Maybe TagState -> Handler m r)
+  -> (ByteString -> Maybe TagState -> Handler m r)
+  -> (ByteString -> Maybe TagState -> Handler m r)
+  -> (ByteString -> Maybe TagState -> Handler m r)
   -> SealedTransitions m r
 
-type SealedTransitions m r
-  = SaxEvent
-  -> Maybe TagState -- stack head
-  -> r              -- accumulator
-  -> m (Maybe TagState, r)
+type SealedTransitions m r = SaxEvent -> Handler m r
+
+type Handler m r
+  = Maybe TagState        -- stack head
+  -> Cont r (Input -> r)  -- result update
+  -> m (Maybe TagState, (Cont r (r -> r)))
+
+data Input = TextVal ByteString | AttrVal ByteString ByteString
+  deriving (Show, Eq)
 
 data TagState
   = Open ByteString
   | EndOfOpen ByteString
   deriving (Show, Eq, Ord)
 
-data PushdownAutomaton r = PushdownAutomaton
+data PushdownAutomaton = PushdownAutomaton
   { paCurrentState :: Maybe SaxEvent
   , paStack        :: [TagState]
   , paAcceptState  :: SaxEvent
-  , paResult       :: r
   }
 
-instance Show r => Show (PushdownAutomaton r) where
-  show (PushdownAutomaton c s a r) =
+instance Show PushdownAutomaton where
+  show (PushdownAutomaton c s a) =
     "PushdownAutomaton { paCurrentState = " ++ show c
     ++ ", paStack = " ++ show s
-    ++ ", paAcceptState = " ++ show a
-    ++ ", paResult = " ++ show r ++ " }"
+    ++ ", paAcceptState = " ++ show a ++ " }"
+    -- ++ ", paResult = " ++ show r ++ " }"
 
-data Hello f = Hello { unHello :: f ByteString }
-
-deriving instance Show (f ByteString) => Show (Hello f)
+data Hello = Hello { unHello :: ByteString }
+  deriving (Show)
 
 safeHead :: [a] -> Maybe (a, [a])
 safeHead [] = Nothing
 safeHead (a:as) = Just (a, as)
 
 eval
-  :: (MonadError ParserException m, Show r)
-  => PushdownAutomaton r
+  :: (MonadError ParserException m)
+  => PushdownAutomaton
   -> SealedTransitions m r
+  -> Cont r (Input -> r)
   -> Stream (Of SaxEvent) m ()
-  -> m r
-eval pa@(PushdownAutomaton _ stack acceptState result) transition s = do
+  -> m (Cont r (Input -> r))
+eval pa@(PushdownAutomaton _ stack acceptState) transition cont s = do
   -- traceM ("automaton: " ++ show pa)
   res <- S.next s
   case res of
@@ -75,40 +84,42 @@ eval pa@(PushdownAutomaton _ stack acceptState result) transition s = do
           Just (h, st) -> (Just h, st)
           Nothing      -> (Nothing, stack)
       if newState == acceptState && Prelude.null stack'
-      then pure result
+      then pure cont
       else do
-        (upd, r) <- transition newState mHead result
+        (upd, k') <- transition newState mHead cont
         -- traceM ("transitioned to: " ++ show (upd, r))
         pa' <- case upd of
           Just nv -> do
             pure $ pa
               { paCurrentState = Just newState
-              , paStack = nv : stack'
-              , paResult = r }
+              , paStack = nv : stack' }
           Nothing -> pure $ pa
-            { paCurrentState = Just newState
-            , paResult = r }
-        eval pa' transition s'
+            { paCurrentState = Just newState }
+            -- , paResult = r }
+        eval pa' transition ((.) <$> k' <*> cont) s'
 
 parseHello
   :: forall m
   . MonadError ParserException m
   => ByteString
-  -> m (Hello Maybe)
-parseHello str = eval automaton transition $ stream'
-  where
+  -> m Hello
+parseHello str = do
+  let
     stream' :: Stream (Of SaxEvent) m ()
-    stream' = stream str
-    automaton :: PushdownAutomaton (Hello Maybe)
-    automaton = PushdownAutomaton Nothing [] acceptState (Hello Nothing)
+    stream'     = stream str
+    automaton   = PushdownAutomaton Nothing [] acceptState
     acceptState = CloseTag "greeting"
-    transition :: SealedTransitions m (Hello Maybe)
-    transition = emptyTransitions
-      & addOpenK "greeting" Nothing (const pure)
-      & addEndK "greeting" Nothing (const pure)
-      & addTextK (Just (EndOfOpen "greeting")) (\t r -> pure $ r { unHello = Just t } )
-      & addCloseK "greeting" Nothing (const pure)
+    transition :: SealedTransitions m Hello
+    transition  = emptyTransitions
+      & addOpenK "greeting" Nothing (\_ -> pure)
+      & addEndK "greeting" Nothing (\_ -> pure)
+      & addTextK (Just (EndOfOpen "greeting"))
+        (\(TextVal t) k -> pure . runCont $ do
+        )
+      -- & addCloseK "greeting" Nothing (\_ -> pure)
       & sealTransitions
+  r <- eval automaton transition (pure $ \(TextVal t) -> Hello t) stream'
+  pure $ _ $ runCont r
 
 helloXml :: ByteString
 helloXml = "<?xml version=\"1.1\"?>\n<foo><greeting>Hello, world!</greeting></foo>"
@@ -150,12 +161,11 @@ addOpenK
   . Applicative m
   => ByteString
   -> Maybe TagState
-  -> (ByteString -> r -> m r)
+  -> (Input -> Cont r (Input -> r) -> m (Cont r (Input -> r)))
   -> Transitions m r
   -> Transitions m r
 addOpenK tagH mt k tran = \o a e t c d ->
   let
-    openK :: ByteString -> Maybe TagState -> r -> m (Maybe TagState, r)
     openK tagInspect mt' = if tagInspect == tagH && checkStackHead mt mt'
       then fmap (Just $ Open tagH,) . k tagH
       else o tagH mt
@@ -182,12 +192,11 @@ addEndK
   . Applicative m
   => ByteString
   -> Maybe TagState
-  -> (ByteString -> r -> m r)
+  -> (Input -> Cont r (Input -> r) -> m (Cont r (Input -> r)))
   -> Transitions m r
   -> Transitions m r
 addEndK tagH mt k tran = \o a e t c d ->
   let
-    endK :: ByteString -> Maybe TagState -> r -> m (Maybe TagState, r)
     endK tagInspect mt' = if tagInspect == tagH && checkStackHead mt mt'
       then fmap (Just $ EndOfOpen tagH,) . k tagH
       else e tagH mt
@@ -197,12 +206,11 @@ addTextK
   :: forall m r
   . Applicative m
   => Maybe TagState
-  -> (ByteString -> r -> m r)
+  -> (Input -> Cont r (Input -> r) -> m (Cont r (Input -> r)))
   -> Transitions m r
   -> Transitions m r
 addTextK mt k tran = \o a e t c d ->
   let
-    textK :: ByteString -> Maybe TagState -> r -> m (Maybe TagState, r)
     textK text mt' = if checkStackHead mt mt'
       then fmap (Nothing,) . k text
       else t text mt
@@ -213,29 +221,27 @@ addCloseK
   . Applicative m
   => ByteString
   -> Maybe TagState
-  -> (ByteString -> r -> m r)
+  -> (Input -> Cont r (Input -> r) -> m (Cont r (Input -> r)))
   -> Transitions m r
   -> Transitions m r
 addCloseK tagH mt k tran = \o a e t c d ->
   let
-    closeK :: ByteString -> Maybe TagState -> r -> m (Maybe TagState, r)
     closeK tagInspect mt' = if tagInspect == tagH && checkStackHead mt mt'
       then fmap (Nothing,) . k tagH
       else c tagH mt
   in tran o a e t closeK d
 
--- addCDATAK
---   :: forall m r
---   . Applicative m
---   => ByteString
---   -> Maybe TagState
---   -> (ByteString -> r -> m r)
---   -> Transitions m r
---   -> Transitions m r
--- addCDATAK cdata mt k tran = \o a e t c d ->
---   let
---     cdataK :: ByteString -> Maybe TagState -> r -> m (Maybe TagState, r)
---     cdataK _ mt' = if checkStackHead mt mt'
---       then fmap (Nothing,) . k cdata
---       else d cdata mt
---   in tran o a e t c cdataK
+addCDATAK
+  :: forall m r
+  . Applicative m
+  => ByteString
+  -> Maybe TagState
+  -> (Input -> Cont r (Input -> r) -> m (Cont r (Input -> r)))
+  -> Transitions m r
+  -> Transitions m r
+addCDATAK cdata mt k tran = \o a e t c d ->
+  let
+    cdataK _ mt' = if checkStackHead mt mt'
+      then fmap (Nothing,) . k cdata
+      else d cdata mt
+  in tran o a e t c cdataK
