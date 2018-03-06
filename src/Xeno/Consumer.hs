@@ -22,6 +22,10 @@ import qualified Streaming.Prelude as S
 import           Xeno.Streaming
 
 
+data Transitions m r = Transitions
+  { tOpen
+  }
+
 type Transitions m r
   =  (ByteString -> Handler m r)
   -> (ByteString -> ByteString -> Handler m r)
@@ -36,7 +40,7 @@ type SealedTransitions m r = SaxEvent -> Handler m r
 type Handler m r
   = Maybe TagState        -- stack head
   -> Cont r (Input -> r)  -- result update
-  -> m (Maybe TagState, (Cont r (r -> r)))
+  -> m (Maybe TagState, (Cont r (Input -> r)))
 
 data Input = TextVal ByteString | AttrVal ByteString ByteString | End
   deriving (Show, Eq)
@@ -72,7 +76,7 @@ eval
   -> SealedTransitions m r
   -> Cont r (Input -> r)
   -> Stream (Of SaxEvent) m ()
-  -> m (Cont r (Input -> r))
+  -> m r
 eval pa@(PushdownAutomaton _ stack acceptState) transition cont s = do
   -- traceM ("automaton: " ++ show pa)
   res <- S.next s
@@ -84,9 +88,9 @@ eval pa@(PushdownAutomaton _ stack acceptState) transition cont s = do
           Just (h, st) -> (Just h, st)
           Nothing      -> (Nothing, stack)
       if newState == acceptState && Prelude.null stack'
-      then pure cont
+      then pure (runCont cont (\k -> k End))
       else do
-        (upd, k') <- transition newState mHead cont
+        (upd, k) <- transition newState mHead cont
         -- traceM ("transitioned to: " ++ show (upd, r))
         pa' <- case upd of
           Just nv -> do
@@ -96,7 +100,14 @@ eval pa@(PushdownAutomaton _ stack acceptState) transition cont s = do
           Nothing -> pure $ pa
             { paCurrentState = Just newState }
             -- , paResult = r }
-        eval pa' transition ((.) <$> k' <*> cont) s'
+        let
+          kont i = do
+            f :: r -> r <- k
+            g :: Input -> r <- cont
+            pure $ f (g i)
+        eval pa' transition kont s'
+
+-- ((\f g i -> (f i $ g i)) <$> k' <*> cont) s'
 
 parseHello
   :: forall m
@@ -111,7 +122,7 @@ parseHello str = do
     acceptState = CloseTag "greeting"
     transition :: SealedTransitions m Hello
     transition  = emptyTransitions
-      & addOpenK (TextVal "greeting") Nothing (\_ -> pure)
+      & addOpenK "greeting" Nothing (\_ -> pure)
       & addEndK (TextVal "greeting") Nothing (\_ -> pure)
       & addTextK (Just (EndOfOpen "greeting"))
         (\tv@(TextVal t) k -> pure $ do
@@ -139,23 +150,17 @@ emptyTransitions = \openK attrK endK textK closeK cdataK event ms r ->
 addOpenK
   :: forall m r
   . Applicative m
-  => Input
+  => ByteString
   -> Maybe TagState
-  -> (Input -> Cont r (Input -> r) -> m (Cont r (Input -> r)))
+  -> (ByteString -> Cont r (r -> r) -> m (Cont r (r -> r)))
   -> Transitions m r
   -> Transitions m r
-addOpenK tagH@(TextVal tag) mt k tran = \o a e t c d ->
+addOpenK tagH mt k tran = \o a e t c d ->
   let
-    openK
-      :: ByteString
-      -> Maybe TagState
-      -> Cont r (Input -> r)
-      -> m (Maybe TagState, (Cont r (r -> r)))
-    openK tagInspect mt' = if tagInspect == tag && checkStackHead mt mt'
-      then \k' -> pure $ (Just (Open tag), do
-                         _
-                         )
-      else _
+    openK tagInspect mt' = if tagInspect == tagH && checkStackHead mt mt'
+      then \k' -> do
+        pure (Just $ Open tagH, pure _)
+      else \k' -> o tagH mt _
   in tran openK a e t c d
 
 sealTransitions
