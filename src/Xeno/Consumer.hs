@@ -25,10 +25,10 @@ import           Xeno.Streaming
 type Transitions m r
   =  (ByteString -> Handler m r)
   -> (ByteString -> ByteString -> Handler m r)
-  -> (ByteString -> Maybe TagState -> Handler m r)
-  -> (ByteString -> Maybe TagState -> Handler m r)
-  -> (ByteString -> Maybe TagState -> Handler m r)
-  -> (ByteString -> Maybe TagState -> Handler m r)
+  -> (ByteString -> Handler m r)
+  -> (ByteString -> Handler m r)
+  -> (ByteString -> Handler m r)
+  -> (ByteString -> Handler m r)
   -> SealedTransitions m r
 
 type SealedTransitions m r = SaxEvent -> Handler m r
@@ -38,7 +38,7 @@ type Handler m r
   -> Cont r (Input -> r)  -- result update
   -> m (Maybe TagState, (Cont r (r -> r)))
 
-data Input = TextVal ByteString | AttrVal ByteString ByteString
+data Input = TextVal ByteString | AttrVal ByteString ByteString | End
   deriving (Show, Eq)
 
 data TagState
@@ -111,15 +111,17 @@ parseHello str = do
     acceptState = CloseTag "greeting"
     transition :: SealedTransitions m Hello
     transition  = emptyTransitions
-      & addOpenK "greeting" Nothing (\_ -> pure)
-      & addEndK "greeting" Nothing (\_ -> pure)
+      & addOpenK (TextVal "greeting") Nothing (\_ -> pure)
+      & addEndK (TextVal "greeting") Nothing (\_ -> pure)
       & addTextK (Just (EndOfOpen "greeting"))
-        (\(TextVal t) k -> pure . runCont $ do
+        (\tv@(TextVal t) k -> pure $ do
+          hello <- k
+          pure $ \_ -> hello tv
         )
-      -- & addCloseK "greeting" Nothing (\_ -> pure)
+      & addCloseK "greeting" Nothing (\_ -> pure)
       & sealTransitions
   r <- eval automaton transition (pure $ \(TextVal t) -> Hello t) stream'
-  pure $ _ $ runCont r
+  pure (runCont r (\f -> f End))
 
 helloXml :: ByteString
 helloXml = "<?xml version=\"1.1\"?>\n<foo><greeting>Hello, world!</greeting></foo>"
@@ -134,11 +136,33 @@ emptyTransitions = \openK attrK endK textK closeK cdataK event ms r ->
     CloseTag s -> closeK s ms r
     CDATA s -> cdataK s ms r
 
+addOpenK
+  :: forall m r
+  . Applicative m
+  => Input
+  -> Maybe TagState
+  -> (Input -> Cont r (Input -> r) -> m (Cont r (Input -> r)))
+  -> Transitions m r
+  -> Transitions m r
+addOpenK tagH@(TextVal tag) mt k tran = \o a e t c d ->
+  let
+    openK
+      :: ByteString
+      -> Maybe TagState
+      -> Cont r (Input -> r)
+      -> m (Maybe TagState, (Cont r (r -> r)))
+    openK tagInspect mt' = if tagInspect == tag && checkStackHead mt mt'
+      then \k' -> pure $ (Just (Open tag), do
+                         _
+                         )
+      else _
+  in tran openK a e t c d
+
 sealTransitions
   :: Applicative m
   => Transitions m r
   -> SealedTransitions m r
-sealTransitions t = t pure3 pure4 pure3 pure3 pure3 pure3
+sealTransitions t = _
 
 checkStackHead :: Maybe TagState -> Maybe TagState -> Bool
 checkStackHead x = \y -> case x of
@@ -147,29 +171,14 @@ checkStackHead x = \y -> case x of
     Nothing -> False
     Just y' -> y' == x'
 
-pure2 :: Applicative m => a -> r -> m (Maybe TagState, r)
-pure2 _ r = pure (Nothing, r)
+pure2 :: Applicative m => a -> m (Maybe TagState, (Cont r (Input -> r)))
+pure2 _ = _
 
-pure3 :: Applicative m => a -> b -> r -> m (Maybe TagState, r)
-pure3 _ _ r = pure (Nothing, r)
+pure3 :: Applicative m => a -> b -> m (Maybe TagState, (Cont r (Input -> r)))
+pure3 _ _ = _
 
-pure4 :: Applicative m => a -> b -> c -> r -> m (Maybe TagState, r)
-pure4 _ _ _ r = pure (Nothing, r)
-
-addOpenK
-  :: forall m r
-  . Applicative m
-  => ByteString
-  -> Maybe TagState
-  -> (Input -> Cont r (Input -> r) -> m (Cont r (Input -> r)))
-  -> Transitions m r
-  -> Transitions m r
-addOpenK tagH mt k tran = \o a e t c d ->
-  let
-    openK tagInspect mt' = if tagInspect == tagH && checkStackHead mt mt'
-      then fmap (Just $ Open tagH,) . k tagH
-      else o tagH mt
-  in tran openK a e t c d
+pure4 :: Applicative m => a -> b -> c -> m (Maybe TagState, (Cont r (Input -> r)))
+pure4 _ _ _ = _
 
 -- addAttrK
 --   :: forall m r
@@ -190,12 +199,12 @@ addOpenK tagH mt k tran = \o a e t c d ->
 addEndK
   :: forall m r
   . Applicative m
-  => ByteString
+  => Input
   -> Maybe TagState
   -> (Input -> Cont r (Input -> r) -> m (Cont r (Input -> r)))
   -> Transitions m r
   -> Transitions m r
-addEndK tagH mt k tran = \o a e t c d ->
+addEndK (TextVal tagH) mt k tran = \o a e t c d ->
   let
     endK tagInspect mt' = if tagInspect == tagH && checkStackHead mt mt'
       then fmap (Just $ EndOfOpen tagH,) . k tagH
