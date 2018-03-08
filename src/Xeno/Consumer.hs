@@ -3,20 +3,19 @@
 {-# LANGUAGE InstanceSigs #-}
 {-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE RankNTypes #-}
-{-# LANGUAGE Strict #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TupleSections #-}
+{-# LANGUAGE ViewPatterns #-}
 
 module Xeno.Consumer where
 
 
-import           Control.Monad.Cont
 import           Control.Monad.Except
 import           Control.Monad.State
 import           Data.ByteString
-import           Data.Function
-import           Debug.Trace
+import           Data.Sequence
 import           Streaming
 import qualified Streaming.Prelude as S
 import           Xeno.Streaming
@@ -32,12 +31,12 @@ data Transition i = Transition
   }
 
 data Transitions = Transitions
-  { openK      :: [Transition ByteString]
-  , attrK      :: [Transition (ByteString, ByteString)]
-  , endOfOpenK :: [Transition ByteString]
-  , textK      :: [Transition ByteString]
-  , closeK     :: [Transition ByteString]
-  , cdataK     :: [Transition ByteString]
+  { openK      :: Seq (Transition ByteString)
+  , attrK      :: Seq (Transition (ByteString, ByteString))
+  , endOfOpenK :: Seq (Transition ByteString)
+  , textK      :: Seq (Transition ByteString)
+  , closeK     :: Seq (Transition ByteString)
+  , cdataK     :: Seq (Transition ByteString)
   }
 
 transit :: Automaton m -> SaxEvent -> Automaton m
@@ -53,22 +52,23 @@ transit pa@(Automaton st t _ _) event = pa { paStack = st' }
 
 applyTransitions
   :: Eq i
-  => [Transition i]
+  => Seq (Transition i)
   -> i
   -> [TagState]
   -> [TagState]
-applyTransitions [ ] i ts = ts
-applyTransitions (Transition iPattern sh su : transitions) i ts =
-  if iPattern == i && case sh of
-    Nothing -> True
-    Just pat -> case mHead of
-      Just tagState -> tagState == pat
-      Nothing  -> False
-  then case su i of
-    Just updVal -> updVal : ts'
-    Nothing     -> ts
-  else applyTransitions transitions i ts
-  where (mHead, ts') = safeHead ts
+applyTransitions (viewl -> se) i ts = case se of
+  EmptyL                                     -> ts
+  (Transition iPattern sh su :< transitions) ->
+    if iPattern == i && case sh of
+      Nothing -> True
+      Just pat -> case mHead of
+        Just tagState -> tagState == pat
+        Nothing  -> False
+    then case su i of
+      Just updVal -> updVal : ts'
+      Nothing     -> ts
+    else applyTransitions transitions i ts
+    where (mHead, ts') = safeHead ts
 
 data TagState
   = Open ByteString
@@ -149,20 +149,18 @@ parse
   => Automaton m
   -> SaxParser m a
   -> m (Result a)
-parse pa@(Automaton stack transition acceptState s) (SaxParser p) = do
+parse pa@(Automaton stack _ acceptState s) (SaxParser p) = do
   -- traceM ("automaton: " ++ show pa)
   res <- S.next s
   case res of
-    Left _               -> throwError $ ParserError $ show pa
+    Left _            -> throwError $ ParserError $ show pa
     Right (event, s') -> do
-      let (mHead, stack') = safeHead stack
+      let (_, stack') = safeHead stack -- FIXME: transit also calls safeHead
       if event == acceptState && Prelude.null stack'
       then pure $ evalState (p Done) pa
       else do
         let pa' = transit pa event
-        parse pa' $ SaxParser $ \ar -> do
-          _
-
+        parse (pa' { paStream = s' }) (SaxParser p)
 
 -- parseHello
 --   :: forall m
