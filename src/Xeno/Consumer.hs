@@ -13,7 +13,6 @@ module Xeno.Consumer where
 
 
 import           Control.Monad.Except
-import           Control.Monad.State
 import           Data.ByteString
 import           Data.Semigroup
 import           Data.Sequence
@@ -44,36 +43,34 @@ instance Semigroup Transitions where
   Transitions o1 a1 e1 t1 c1 d1 <> Transitions o2 a2 e2 t2 c2 d2
     = Transitions (o1 >< o2) (a1 >< a2) (e1 >< e2) (t1 >< t2) (c1 >< c2) (d1 >< d2)
 
-transit :: Transitions -> Automaton m -> SaxEvent -> Automaton m
-transit t pa@(Automaton st _) event = pa { paStack = st' }
-  where
-    st' = case event of
-      OpenTag s -> applyTransitions (openK t) s st
-      Attr n s -> applyTransitions (attrK t) (n,s) st
-      EndOfOpenTag s -> applyTransitions (endOfOpenK t) s st
-      Text s -> applyTransitions (textK t) s st
-      CloseTag s -> applyTransitions (closeK t) s st
-      CDATA s -> applyTransitions (cdataK t) s st
+transit :: Transitions -> Maybe TagState -> [TagState] -> SaxEvent -> [TagState]
+transit t mt st event = case event of
+  OpenTag s -> applyTransitions s mt st (openK t)
+  Attr n s -> applyTransitions (n,s) mt st (attrK t)
+  EndOfOpenTag s -> applyTransitions s mt st (endOfOpenK t)
+  Text s -> applyTransitions s mt st (textK t)
+  CloseTag s -> applyTransitions s mt st (closeK t)
+  CDATA s -> applyTransitions s mt st (cdataK t)
 
 applyTransitions
   :: Eq i
-  => Seq (Transition i)
-  -> i
+  => i
+  -> Maybe TagState
   -> [TagState]
+  -> Seq (Transition i)
   -> [TagState]
-applyTransitions (viewl -> se) i ts = case se of
+applyTransitions i mHead ts (viewl -> se) = case se of
   EmptyL                                     -> ts
   (Transition iPattern sh su :< transitions) ->
     if iPattern == i && case sh of
       Nothing -> True
       Just pat -> case mHead of
         Just tagState -> tagState == pat
-        Nothing  -> False
+        Nothing       -> False
     then case su i of
-      Just updVal -> updVal : ts'
+      Just updVal -> updVal : ts
       Nothing     -> ts
-    else applyTransitions transitions i ts
-    where (mHead, ts') = safeHead ts
+    else applyTransitions i mHead ts transitions
 
 data TagState
   = Open ByteString
@@ -100,8 +97,8 @@ safeHead :: [a] -> (Maybe a, [a])
 safeHead l@[] = (Nothing, l)
 safeHead (a:as) = (Just a, as)
 
-data Result r
-  = Partial (Input -> (Result r))
+data Result m r
+  = Partial (Input -> (Result m r)) (Stream (Of SaxEvent) m ()) [TagState]
 --     -- ^ Supply this continuation with more input so that the parser
 --     -- can resume.  To indicate that no more input is available, pass
 --     -- an empty string to the continuation.
@@ -130,46 +127,48 @@ newtype SaxParser m a = SaxParser
     :: forall r. (MonadError ParserException m)
     => Transitions
     -> SaxEvent       -- accept state
-    -> (a -> Result r)
-    -> State (Automaton m) (Result r)
+    -> Stream (Of SaxEvent) m ()
+    -> [TagState]     -- stack
+    -> (a -> Result m r)
+    -> Result m r
   }
 
 instance Functor (SaxParser m) where
-  fmap f (SaxParser p) = SaxParser $ \tr as ir -> p tr as (\a -> ir (f a))
+  fmap f (SaxParser p) =
+    SaxParser $ \tr as s st ir -> p tr as s st (\a -> ir (f a))
 
 instance Applicative (SaxParser m) where
-  pure a = SaxParser $ \_ _ k -> pure . k $ a
-  SaxParser f <*> SaxParser x = SaxParser $ \tr as k -> do
-    st <- get
-    x tr as $ \a -> evalState (f tr as $ \ab -> k $ ab a) st
+  pure a = SaxParser $ \_ _ _ _ k -> k $ a
+  SaxParser f <*> SaxParser x = SaxParser $ \tr as s st k ->
+    x tr as s st $ \a -> f tr as s st $ \ab -> k $ ab a
 
 instance Monad (SaxParser m) where
-  SaxParser p >>= k = SaxParser $ \tr as ir -> do
-    st <- get
-    p tr as $ \a -> evalState (runSaxParser (k a) tr as $ \b -> ir b) st
+  SaxParser p >>= k = SaxParser $ \tr as s st ir ->
+    p tr as s st $ \a -> runSaxParser (k a) tr as s st $ \b -> ir b
 
 parse
   :: (MonadError ParserException m)
   => Transitions
   -> SaxEvent
-  -> Automaton m
+  -> Stream (Of SaxEvent) m ()
+  -> [TagState]
   -> SaxParser m a
-  -> m (Result a)
-parse transitions acceptState pa@(Automaton stack s) (SaxParser p) = do
+  -> m (Result m a)
+parse transitions acceptState s stack (SaxParser p) = do
   -- traceM ("automaton: " ++ show pa)
   res <- S.next s
   case res of
-    Left _            -> throwError $ ParserError $ show pa
+    Left _            -> throwError $ ParserError $ show (stack, acceptState)
     Right (event, s') -> do
-      let (_, stack') = safeHead stack -- FIXME: transit also calls safeHead
+      let (mHead, stack') = safeHead stack
       if event == acceptState && Prelude.null stack'
-      then pure $ evalState (p transitions acceptState Done) pa
+      then pure $ p transitions acceptState s' stack' Done
       else do
-        let pa' = transit transitions pa event
-        parse transitions acceptState (pa' { paStream = s' }) (SaxParser p)
+        let stack'' = transit transitions mHead stack' event
+        parse transitions acceptState s' stack'' (SaxParser p)
 
 -- openTag :: ByteString -> SaxParser m a
--- openTag tag = SaxParser $ \tr as k -> _
+-- openTag tag = SaxParser $ \tr as s st' k -> case
 
 -- withTag :: ByteString -> SaxParser m a -> SaxParser m a
 -- withTag tag (SaxParser s) = SaxParser $ \a -> do
