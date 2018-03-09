@@ -15,6 +15,7 @@ module Xeno.Consumer where
 import           Control.Monad.Except
 import           Control.Monad.State
 import           Data.ByteString
+import           Data.Semigroup
 import           Data.Sequence
 import           Streaming
 import qualified Streaming.Prelude as S
@@ -39,8 +40,12 @@ data Transitions = Transitions
   , cdataK     :: Seq (Transition ByteString)
   }
 
+instance Semigroup Transitions where
+  Transitions o1 a1 e1 t1 c1 d1 <> Transitions o2 a2 e2 t2 c2 d2
+    = Transitions (o1 >< o2) (a1 >< a2) (e1 >< e2) (t1 >< t2) (c1 >< c2) (d1 >< d2)
+
 transit :: Transitions -> Automaton m -> SaxEvent -> Automaton m
-transit t pa@(Automaton st _ _) event = pa { paStack = st' }
+transit t pa@(Automaton st _) event = pa { paStack = st' }
   where
     st' = case event of
       OpenTag s -> applyTransitions (openK t) s st
@@ -77,15 +82,13 @@ data TagState
 
 data Automaton m = Automaton
   { paStack        :: [TagState]
-  , paAcceptState  :: SaxEvent
   , paStream       :: Stream (Of SaxEvent) m ()
   }
 
 instance Show (Automaton m) where
-  show (Automaton st a _) =
+  show (Automaton st _) =
     "Automaton { "
     ++ ", paStack = " ++ show st
-    ++ ", paAcceptState = " ++ show a
 
 data World = World ByteString
   deriving (Show)
@@ -126,31 +129,33 @@ newtype SaxParser m a = SaxParser
   { runSaxParser
     :: forall r. (MonadError ParserException m)
     => Transitions
+    -> SaxEvent       -- accept state
     -> (a -> Result r)
     -> State (Automaton m) (Result r)
   }
 
 instance Functor (SaxParser m) where
-  fmap f (SaxParser p) = SaxParser $ \tr ir -> p tr (\a -> ir (f a))
+  fmap f (SaxParser p) = SaxParser $ \tr as ir -> p tr as (\a -> ir (f a))
 
 instance Applicative (SaxParser m) where
-  pure a = SaxParser $ \_ k -> pure . k $ a
-  SaxParser f <*> SaxParser x = SaxParser $ \tr k -> do
+  pure a = SaxParser $ \_ _ k -> pure . k $ a
+  SaxParser f <*> SaxParser x = SaxParser $ \tr as k -> do
     st <- get
-    x tr $ \a -> evalState (f tr $ \ab -> k $ ab a) st
+    x tr as $ \a -> evalState (f tr as $ \ab -> k $ ab a) st
 
 instance Monad (SaxParser m) where
-  SaxParser p >>= k = SaxParser $ \tr ir -> do
+  SaxParser p >>= k = SaxParser $ \tr as ir -> do
     st <- get
-    p tr $ \a -> evalState (runSaxParser (k a) tr $ \b -> ir b) st
+    p tr as $ \a -> evalState (runSaxParser (k a) tr as $ \b -> ir b) st
 
 parse
   :: (MonadError ParserException m)
   => Transitions
+  -> SaxEvent
   -> Automaton m
   -> SaxParser m a
   -> m (Result a)
-parse transitions pa@(Automaton stack acceptState s) (SaxParser p) = do
+parse transitions acceptState pa@(Automaton stack s) (SaxParser p) = do
   -- traceM ("automaton: " ++ show pa)
   res <- S.next s
   case res of
@@ -158,13 +163,13 @@ parse transitions pa@(Automaton stack acceptState s) (SaxParser p) = do
     Right (event, s') -> do
       let (_, stack') = safeHead stack -- FIXME: transit also calls safeHead
       if event == acceptState && Prelude.null stack'
-      then pure $ evalState (p transitions Done) pa
+      then pure $ evalState (p transitions acceptState Done) pa
       else do
         let pa' = transit transitions pa event
-        parse transitions (pa' { paStream = s' }) (SaxParser p)
+        parse transitions acceptState (pa' { paStream = s' }) (SaxParser p)
 
 -- openTag :: ByteString -> SaxParser m a
--- openTag tag = SaxParser $ \a ->
+-- openTag tag = SaxParser $ \tr as k -> _
 
 -- withTag :: ByteString -> SaxParser m a -> SaxParser m a
 -- withTag tag (SaxParser s) = SaxParser $ \a -> do
