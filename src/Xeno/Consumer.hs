@@ -14,6 +14,7 @@ module Xeno.Consumer where
 
 import           Control.Monad.Fail
 import           Data.ByteString hiding (empty)
+import           Data.Semigroup hiding (Any)
 import           Debug.Trace
 import           Streaming hiding ((<>))
 import qualified Streaming.Prelude as S
@@ -54,6 +55,11 @@ data Exactly a
   = Exactly a
   | Any
   deriving (Functor, Show)
+
+instance Semigroup a => Semigroup (Exactly a) where
+  Any       <> _         = Any
+  _         <> Any       = Any
+  Exactly a <> Exactly b = Exactly (a <> b)
 
 compareExactly :: Eq a => Exactly a -> Exactly a -> Bool
 compareExactly Any         _           = True
