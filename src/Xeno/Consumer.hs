@@ -50,6 +50,16 @@ data TagState
   | EndOfOpen ByteString
   deriving (Show, Eq, Ord)
 
+data Exactly a
+  = Exactly a
+  | Any
+  deriving (Functor, Show)
+
+compareExactly :: Eq a => Exactly a -> Exactly a -> Bool
+compareExactly Any         _           = True
+compareExactly _           Any         = True
+compareExactly (Exactly a) (Exactly b) = a == b
+
 type SaxStream = Stream (Of SaxEvent) (Either ParserException) ()
 
 data World = World ByteString
@@ -59,17 +69,14 @@ data Hello = Hello { hHello :: ByteString, hWorld :: World }
   deriving (Show)
 
 safeHead :: [a] -> (Maybe a, [a])
-safeHead l@[] = (Nothing, l)
+safeHead l@[]   = (Nothing, l)
 safeHead (a:as) = (Just a, as)
 
 data Result r
-  = Partial (Input -> (Result r)) SaxEvent SaxStream [TagState]
+  = Partial (Input -> (Result r)) (Exactly SaxEvent) SaxStream [TagState]
   -- ^ Supply this continuation with more input so that the parser
   -- can resume.  To indicate that no more input is available, pass
   -- an empty string to the continuation.
-  --
-  -- __Note__: if you get a 'Partial' result, do not call its
-  -- continuation more than once.
   | Done r
   -- ^ The parse succeeded.  The @i@ parameter is the input that had
   -- not yet been consumed (if any) when the parse succeeded.
@@ -87,10 +94,10 @@ instance Show r => Show (Result r) where
 
 newtype SaxParser a = SaxParser
   { runSaxParser :: forall r
-    .  SaxEvent
+    .  Exactly SaxEvent
     -> [TagState]
     -> SaxStream
-    -> (SaxEvent -> [TagState] -> SaxStream -> a -> Result r)
+    -> (Exactly SaxEvent -> [TagState] -> SaxStream -> a -> Result r)
     -> Result r
   }
 
@@ -101,6 +108,8 @@ instance Functor SaxParser where
 instance Applicative SaxParser where
   pure a = SaxParser $ \as st s k -> k as st s a
   (<*>) = apm
+  f *> k = f >>= const k
+  k <* f = k >>= \a -> f >> pure a
 
 apm :: SaxParser (a -> b) -> SaxParser a -> SaxParser b
 apm pab pa = do
@@ -117,23 +126,19 @@ instance Monad SaxParser where
 instance MonadFail SaxParser where
   fail s = SaxParser $ \_ _ _ _ -> Fail s
 
-parseSax :: SaxParser a -> SaxEvent -> SaxStream -> Result a
+parseSax :: SaxParser a -> Exactly SaxEvent -> SaxStream -> Result a
 parseSax (SaxParser p) as s = p as [] s (\_ _ _ a -> Done a)
 
 -- skipUntil :: SaxParser a -> SaxParser a
--- skipUntil (SaxParser p) = SaxParser $ \as tr st s fk k ->
---   case S.next s of
---    Left _                    -> Fail "FIXME: stream exhausted"
---    Right (Right (event, s')) ->
---      if event == as && Prelude.null poppedStack
---      p as (tr id) st
+-- skipUntil (SaxParser p) = SaxParser $ \as st s k ->
+--   Partial _ _ _ _
 
--- skip :: SaxParser ()
--- skip = SaxParser $ \_ st s k ->
---   case S.next s of
---     Right (Right (event, s')) -> trace ("skip event: " ++ show event)
---       $ Partial (\_ -> k ()) s' st
---     _                         -> Fail "skip: stream exhausted"
+skip :: SaxParser ()
+skip = SaxParser $ \as st s k ->
+  case S.next s of
+    Right (Right (event, s')) -> trace ("skip event: " ++ show event)
+      $ k as st s' ()
+    _                         -> Fail "skip: stream exhausted"
 
 openTag :: ByteString -> SaxParser ()
 openTag tag = SaxParser $ \as st s k ->
@@ -145,39 +150,47 @@ openTag tag = SaxParser $ \as st s k ->
      case event of
        OpenTag tagN ->
          let (mHead, poppedStack) = safeHead st
-         in if event == as && Prelude.null poppedStack
-         then trace "openTag event: finalize" $ k event poppedStack s' ()
+         in if Exactly event `compareExactly` as && Prelude.null poppedStack
+         then trace "openTag event: finalize" $ k (Exactly $ EndOfOpenTag tag) poppedStack s' ()
          else
            let
              newStack =
                if tagN == tag
                then transit mHead Nothing (Push $ Open tag) poppedStack
                else poppedStack
-           in trace "openTag: recursive parse" $ k (EndOfOpenTag tag) newStack s' ()
-       _            -> Partial (\_ -> k event st s' ()) event s' st
+           in trace "openTag: recursive parse" $ k (Exactly $ EndOfOpenTag tag) newStack s' ()
+       _            -> Partial (\_ -> k as st s' ()) as s' st
    _                         -> Fail $ "openTag " ++ show tag ++ ": stream exhausted"
 
 endOfOpenTag :: ByteString -> SaxParser ()
 endOfOpenTag tag = SaxParser $ \as st s k ->
   case S.next s of
    Right (Right (event, s')) ->
-     trace ("endOfOpenTag event: " ++ show event) $
-     trace ("endOfOpenTag acceptedState: " ++ show as) $
-     trace ("endOfOpenTag stack: " ++ show st) $
+     trace ("endOfOpenTag " ++ show tag ++ " event: " ++ show event) $
+     trace ("endOfOpenTag " ++ show tag ++ " acceptedState: " ++ show as) $
+     trace ("endOfOpenTag " ++ show tag ++ " stack: " ++ show st) $
      case event of
-       OpenTag tagN ->
-         let (mHead, poppedStack) = safeHead st
-         in if event == as && Prelude.null poppedStack
-         then k event poppedStack s' ()
-         else
-           let
-             newStack =
-               if tagN == tag
-               then transit mHead (Just $ Open tag) (Push $ EndOfOpen tag) poppedStack
-               else poppedStack
-           in trace "endOfOpenTag: recursive parse" $ k event newStack s' ()
-       _            -> Partial (\_ -> k event st s' ()) event s' st
+       EndOfOpenTag tagN ->
+         let
+           (mHead, poppedStack) = safeHead st
+           newStack             = if tagN == tag
+             then transit mHead (Just $ Open tag) (Push $ EndOfOpen tag) poppedStack
+             else poppedStack
+         in trace "endOfOpenTag: recursive parse" $
+           k (Exactly $ CloseTag tag) newStack s' ()
+       _            -> Partial (\_ -> k (Exactly $ CloseTag tag) st s' ()) (Exactly $ CloseTag tag) s' st
    _                         -> Fail $ "endOfOpenTag " ++ show tag ++ ": stream exhausted"
+
+text :: SaxParser ByteString
+text = SaxParser $ \as st s k -> case S.next s of
+  Right (Right (event, s')) ->
+    trace ("text event: " ++ show event) $
+    trace ("text acceptedState: " ++ show as) $
+    trace ("text stack: " ++ show st) $
+    case event of
+      Text textVal -> trace "text: recursive parse" $ k as st s' textVal
+      _            -> Fail "expected text value"
+  _                         -> Fail $ "text stream exhausted"
 
 closeTag :: ByteString -> SaxParser ()
 closeTag tag = SaxParser $ \as st s k ->
@@ -187,18 +200,18 @@ closeTag tag = SaxParser $ \as st s k ->
      trace ("closeTag acceptedState: " ++ show as) $
      trace ("closeTag stack: " ++ show st) $
      case event of
-       OpenTag tagN ->
+       CloseTag tagN ->
          let (mHead, poppedStack) = safeHead st
-         in if event == as && Prelude.null poppedStack
-         then k event poppedStack s' ()
+         in if Exactly event `compareExactly` as && Prelude.null poppedStack
+         then trace "closeTag: finalizing" $ k Any poppedStack s' ()
          else
            let
              newStack =
                if tagN == tag
                then transit mHead (Just $ EndOfOpen tag) NoOp poppedStack
                else poppedStack
-           in trace "closeTag: recursive parse" $ k event newStack s' ()
-       _            -> Partial (\_ -> k event st s' ()) event s' st
+           in trace "closeTag: recursive parse" $ k Any newStack s' ()
+       _            -> Partial (\_ -> k as st s' ()) as s' st
    _                         -> Fail $ "closeTag " ++ show tag ++ ": stream exhausted"
 
 -- textVal :: Maybe TagState -> SaxParser ByteString
