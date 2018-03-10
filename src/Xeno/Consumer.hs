@@ -12,11 +12,12 @@
 module Xeno.Consumer where
 
 
-import           Control.Monad.Except
-import           Data.ByteString
+import           Control.Monad.Fail
+import           Data.ByteString hiding (empty)
 import           Data.Semigroup
 import           Data.Sequence
-import           Streaming
+import           Debug.Trace
+import           Streaming hiding ((<>))
 import qualified Streaming.Prelude as S
 import           Xeno.Streaming
 
@@ -27,8 +28,37 @@ data Input = TextVal ByteString | AttVal ByteString ByteString | End
 data Transition i = Transition
   { tInput :: i
   , tStackHead :: Maybe TagState
-  , tStateUpdate :: i -> Maybe TagState
-  }
+  , tStateUpdate :: Maybe TagState
+  } deriving (Show)
+
+trans
+  :: Maybe TagState
+  -> Maybe TagState
+  -> Maybe TagState
+  -> [TagState]
+  -> [TagState]
+trans mt sh su st =
+  if case mt of
+    Nothing -> True
+    Just tp -> case sh of
+      Nothing -> False
+      Just h  -> tp == h
+  then case su of
+    Nothing -> st
+    Just ns -> ns : st
+  else st
+
+transit1 :: Eq i => i -> Maybe TagState -> Transition i -> [TagState] -> [TagState]
+transit1 i mt (Transition ip sh su) st =
+  if i == ip && case mt of
+    Nothing -> True
+    Just tp -> case sh of
+      Nothing -> False
+      Just h  -> tp == h
+  then case su of
+    Nothing -> st
+    Just ns -> ns : st
+  else st
 
 data Transitions = Transitions
   { openK      :: Seq (Transition ByteString)
@@ -37,7 +67,28 @@ data Transitions = Transitions
   , textK      :: Seq (Transition ByteString)
   , closeK     :: Seq (Transition ByteString)
   , cdataK     :: Seq (Transition ByteString)
-  }
+  } deriving (Show)
+
+emptyTransitions :: Transitions
+emptyTransitions = Transitions empty empty empty empty empty empty
+
+addOpenK :: Transition ByteString -> Transitions -> Transitions
+addOpenK new tr = tr { openK = new <| openK tr }
+
+addAttrK :: Transition (ByteString, ByteString) -> Transitions -> Transitions
+addAttrK new tr = tr { attrK = new <| attrK tr }
+
+addEndOfOpenK :: Transition ByteString -> Transitions -> Transitions
+addEndOfOpenK new tr = tr { endOfOpenK = new <| endOfOpenK tr }
+
+addTextK :: Transition ByteString -> Transitions -> Transitions
+addTextK new tr = tr { textK = new <| textK tr }
+
+addCloseK :: Transition ByteString -> Transitions -> Transitions
+addCloseK new tr = tr { closeK = new <| closeK tr }
+
+addCdataK :: Transition ByteString -> Transitions -> Transitions
+addCdataK new tr = tr { cdataK = new <| cdataK tr }
 
 instance Semigroup Transitions where
   Transitions o1 a1 e1 t1 c1 d1 <> Transitions o2 a2 e2 t2 c2 d2
@@ -67,7 +118,7 @@ applyTransitions i mHead ts (viewl -> se) = case se of
       Just pat -> case mHead of
         Just tagState -> tagState == pat
         Nothing       -> False
-    then case su i of
+    then case su of
       Just updVal -> updVal : ts
       Nothing     -> ts
     else applyTransitions i mHead ts transitions
@@ -77,15 +128,7 @@ data TagState
   | EndOfOpen ByteString
   deriving (Show, Eq, Ord)
 
-data Automaton m = Automaton
-  { paStack        :: [TagState]
-  , paStream       :: Stream (Of SaxEvent) m ()
-  }
-
-instance Show (Automaton m) where
-  show (Automaton st _) =
-    "Automaton { "
-    ++ ", paStack = " ++ show st
+type SaxStream = Stream (Of SaxEvent) (Either ParserException) ()
 
 data World = World ByteString
   deriving (Show)
@@ -97,78 +140,127 @@ safeHead :: [a] -> (Maybe a, [a])
 safeHead l@[] = (Nothing, l)
 safeHead (a:as) = (Just a, as)
 
-data Result m r
-  = Partial (Input -> (Result m r)) (Stream (Of SaxEvent) m ()) [TagState]
---     -- ^ Supply this continuation with more input so that the parser
---     -- can resume.  To indicate that no more input is available, pass
---     -- an empty string to the continuation.
---     --
---     -- __Note__: if you get a 'Partial' result, do not call its
---     -- continuation more than once.
+data Result r
+  = Partial (Input -> (Result r)) SaxEvent SaxStream [TagState]
+  -- ^ Supply this continuation with more input so that the parser
+  -- can resume.  To indicate that no more input is available, pass
+  -- an empty string to the continuation.
+  --
+  -- __Note__: if you get a 'Partial' result, do not call its
+  -- continuation more than once.
   | Done r
---     -- ^ The parse succeeded.  The @i@ parameter is the input that had
---     -- not yet been consumed (if any) when the parse succeeded.
+  -- ^ The parse succeeded.  The @i@ parameter is the input that had
+  -- not yet been consumed (if any) when the parse succeeded.
+  | Fail String
+  -- ^ The parse failed with current message
   deriving (Functor)
 
--- newtype Parser i a = Parser {
---       runParser :: forall r.
---                    State i -> Pos -> More
---                 -> Failure i (State i)   r
---                 -> Success i (State i) a r
---                 -> IResult i r
---     }
+instance Show r => Show (Result r) where
+  show (Fail s) = "Fail " ++ s
+  show (Partial _ as _ st) = "Partial { <...>,"
+    ++ "paAcceptedState: " ++ show as
+    ++ ", psStack: " ++ show st
+    ++ " }"
+  show (Done r) = "Done " ++ show r
 
--- type Failure i t   r = t -> Pos -> More -> [String] -> String
---                        -> IResult i r
--- type Success i t a r = t -> Pos -> More -> a -> IResult i r
-
-newtype SaxParser m a = SaxParser
-  { runSaxParser
-    :: forall r. (MonadError ParserException m)
-    => Transitions
-    -> SaxEvent       -- accept state
-    -> Stream (Of SaxEvent) m ()
-    -> [TagState]     -- stack
-    -> (a -> Result m r)
-    -> Result m r
+newtype SaxParser a = SaxParser
+  { runSaxParser :: forall r
+    .  SaxEvent
+    -> [TagState]
+    -> SaxStream
+    -> (SaxEvent -> [TagState] -> SaxStream -> a -> Result r)
+    -> Result r
   }
 
-instance Functor (SaxParser m) where
+instance Functor SaxParser where
   fmap f (SaxParser p) =
-    SaxParser $ \tr as s st ir -> p tr as s st (\a -> ir (f a))
+    SaxParser $ \as st s k -> p as st s (\_ _ _ a -> k as st s (f a))
 
-instance Applicative (SaxParser m) where
-  pure a = SaxParser $ \_ _ _ _ k -> k $ a
-  SaxParser f <*> SaxParser x = SaxParser $ \tr as s st k ->
-    x tr as s st $ \a -> f tr as s st $ \ab -> k $ ab a
+instance Applicative SaxParser where
+  pure a = SaxParser $ \as st s k -> k as st s a
+  (<*>) = apm
 
-instance Monad (SaxParser m) where
-  SaxParser p >>= k = SaxParser $ \tr as s st ir ->
-    p tr as s st $ \a -> runSaxParser (k a) tr as s st $ \b -> ir b
+apm :: SaxParser (a -> b) -> SaxParser a -> SaxParser b
+apm pab pa = do
+  ab <- pab
+  a <- pa
+  return $ ab a
 
-parse
-  :: (MonadError ParserException m)
-  => Transitions
-  -> SaxEvent
-  -> Stream (Of SaxEvent) m ()
-  -> [TagState]
-  -> SaxParser m a
-  -> m (Result m a)
-parse transitions acceptState s stack (SaxParser p) = do
-  -- traceM ("automaton: " ++ show pa)
-  res <- S.next s
-  case res of
-    Left _            -> throwError $ ParserError $ show (stack, acceptState)
-    Right (event, s') -> do
-      let (mHead, stack') = safeHead stack
-      if event == acceptState && Prelude.null stack'
-      then pure $ p transitions acceptState s' stack' Done
-      else do
-        let stack'' = transit transitions mHead stack' event
-        parse transitions acceptState s' stack'' (SaxParser p)
+instance Monad SaxParser where
+  return = pure
+  SaxParser p >>= k = SaxParser $ \as st s ir ->
+    let f as' st' s' a = runSaxParser (k a) as' st' s' ir
+    in p as st s f
 
--- openTag :: ByteString -> SaxParser m a
--- openTag tag = SaxParser $ \tr as s st' k -> case
+-- instance MonadFail SaxParser where
+--   fail s = SaxParser $ \_ _ _ _ _ _ -> Fail s
+
+parseSax :: SaxParser a -> SaxEvent -> SaxStream -> Result a
+parseSax (SaxParser p) as s = p as [] s (\_ _ _ a -> Done a)
+
+-- eval
+--   :: ((Transitions -> Transitions) -> Transitions)
+--   -> SaxEvent
+--   -> SaxStream
+--   -> [TagState]
+--   -> SaxParser a
+--   -> (Result a)
+-- eval kt acceptState s stack (SaxParser p) =
+--   case S.next s of
+--     Left _                    -> Fail "FIXME: stream exhausted"
+--     Right (Right (event, s')) ->
+--       let (mHead, stack') = safeHead stack
+--       in if event == acceptState && Prelude.null stack'
+--       then p kt acceptState s stack' Done
+--       else let stack'' = transit (kt id) mHead stack' event
+--         -- in parse transitions acceptState s' stack'' (SaxParser p)
+--         in p kt acceptState s' stack'' (\i -> _)
+
+-- skipUntil :: SaxParser a -> SaxParser a
+-- skipUntil (SaxParser p) = SaxParser $ \as tr st s fk k ->
+--   case S.next s of
+--    Left _                    -> Fail "FIXME: stream exhausted"
+--    Right (Right (event, s')) ->
+--      if event == as && Prelude.null poppedStack
+--      p as (tr id) st
+
+-- skip :: SaxParser ()
+-- skip = SaxParser $ \_ st s k ->
+--   case S.next s of
+--     Right (Right (event, s')) -> trace ("skip event: " ++ show event)
+--       $ Partial (\_ -> k ()) s' st
+--     _                         -> Fail "skip: stream exhausted"
+
+openTag :: ByteString -> Maybe TagState -> SaxParser ()
+openTag tag mt = SaxParser $ \as st s k ->
+  case S.next s of
+   Right (Right (event, s')) ->
+     trace ("openTag event: " ++ show event) $
+     trace ("openTag acceptedState: " ++ show as) $
+     trace ("openTag stack: " ++ show st) $
+     case event of
+       OpenTag tagN ->
+         let (mHead, poppedStack) = safeHead st
+         in if event == as && Prelude.null poppedStack
+         then k ()
+         else
+           let
+             newStack =
+               if tagN == tag
+               then trans mHead mt (Just $ Open tag) poppedStack
+               else poppedStack
+           in Partial (\_ -> k ()) s' newStack
+       _            -> Partial (\_ -> k ()) s' st
+   _                         -> Fail $ "openTag " ++ show tag ++ ": stream exhausted"
+
+-- textVal :: Maybe TagState -> SaxParser ByteString
+-- textVal mt = SaxParser $ \as tr s k ->
+--   Partial  (\tk -> tk . updt $ tr))
+--   where
+--     updt = addTextK
+
+-- test :: Result ()
+-- test = parse (\k -> k emptyTransitions) (EndOfOpenTag "foo") (stream helloXml) [] (openTag "foo")
 
 -- withTag :: ByteString -> SaxParser m a -> SaxParser m a
 -- withTag tag (SaxParser s) = SaxParser $ \a -> do
