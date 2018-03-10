@@ -14,8 +14,6 @@ module Xeno.Consumer where
 
 import           Control.Monad.Fail
 import           Data.ByteString hiding (empty)
-import           Data.Semigroup
-import           Data.Sequence
 import           Debug.Trace
 import           Streaming hiding ((<>))
 import qualified Streaming.Prelude as S
@@ -25,103 +23,27 @@ import           Xeno.Streaming
 data Input = TextVal ByteString | AttVal ByteString ByteString | End
   deriving (Show, Eq)
 
-data Transition i = Transition
-  { tInput :: i
-  , tStackHead :: Maybe TagState
-  , tStateUpdate :: Maybe TagState
-  } deriving (Show)
+data StackAction a
+  = Push a
+  | NoOp
+  deriving (Show, Functor, Eq)
 
-trans
-  :: Maybe TagState
-  -> Maybe TagState
-  -> Maybe TagState
+transit
+  :: Maybe TagState -- ^ head of the current stack
+  -> Maybe TagState -- ^ search pattern
+  -> StackAction TagState
   -> [TagState]
   -> [TagState]
-trans mt sh su st =
+transit mt sh sa st =
   if case mt of
     Nothing -> True
     Just tp -> case sh of
       Nothing -> False
       Just h  -> tp == h
-  then case su of
-    Nothing -> st
-    Just ns -> ns : st
+  then case sa of
+    NoOp -> st
+    Push ns -> ns : st
   else st
-
-transit1 :: Eq i => i -> Maybe TagState -> Transition i -> [TagState] -> [TagState]
-transit1 i mt (Transition ip sh su) st =
-  if i == ip && case mt of
-    Nothing -> True
-    Just tp -> case sh of
-      Nothing -> False
-      Just h  -> tp == h
-  then case su of
-    Nothing -> st
-    Just ns -> ns : st
-  else st
-
-data Transitions = Transitions
-  { openK      :: Seq (Transition ByteString)
-  , attrK      :: Seq (Transition (ByteString, ByteString))
-  , endOfOpenK :: Seq (Transition ByteString)
-  , textK      :: Seq (Transition ByteString)
-  , closeK     :: Seq (Transition ByteString)
-  , cdataK     :: Seq (Transition ByteString)
-  } deriving (Show)
-
-emptyTransitions :: Transitions
-emptyTransitions = Transitions empty empty empty empty empty empty
-
-addOpenK :: Transition ByteString -> Transitions -> Transitions
-addOpenK new tr = tr { openK = new <| openK tr }
-
-addAttrK :: Transition (ByteString, ByteString) -> Transitions -> Transitions
-addAttrK new tr = tr { attrK = new <| attrK tr }
-
-addEndOfOpenK :: Transition ByteString -> Transitions -> Transitions
-addEndOfOpenK new tr = tr { endOfOpenK = new <| endOfOpenK tr }
-
-addTextK :: Transition ByteString -> Transitions -> Transitions
-addTextK new tr = tr { textK = new <| textK tr }
-
-addCloseK :: Transition ByteString -> Transitions -> Transitions
-addCloseK new tr = tr { closeK = new <| closeK tr }
-
-addCdataK :: Transition ByteString -> Transitions -> Transitions
-addCdataK new tr = tr { cdataK = new <| cdataK tr }
-
-instance Semigroup Transitions where
-  Transitions o1 a1 e1 t1 c1 d1 <> Transitions o2 a2 e2 t2 c2 d2
-    = Transitions (o1 >< o2) (a1 >< a2) (e1 >< e2) (t1 >< t2) (c1 >< c2) (d1 >< d2)
-
-transit :: Transitions -> Maybe TagState -> [TagState] -> SaxEvent -> [TagState]
-transit t mt st event = case event of
-  OpenTag s -> applyTransitions s mt st (openK t)
-  Attr n s -> applyTransitions (n,s) mt st (attrK t)
-  EndOfOpenTag s -> applyTransitions s mt st (endOfOpenK t)
-  Text s -> applyTransitions s mt st (textK t)
-  CloseTag s -> applyTransitions s mt st (closeK t)
-  CDATA s -> applyTransitions s mt st (cdataK t)
-
-applyTransitions
-  :: Eq i
-  => i
-  -> Maybe TagState
-  -> [TagState]
-  -> Seq (Transition i)
-  -> [TagState]
-applyTransitions i mHead ts (viewl -> se) = case se of
-  EmptyL                                     -> ts
-  (Transition iPattern sh su :< transitions) ->
-    if iPattern == i && case sh of
-      Nothing -> True
-      Just pat -> case mHead of
-        Just tagState -> tagState == pat
-        Nothing       -> False
-    then case su of
-      Just updVal -> updVal : ts
-      Nothing     -> ts
-    else applyTransitions i mHead ts transitions
 
 data TagState
   = Open ByteString
@@ -192,29 +114,11 @@ instance Monad SaxParser where
     let f as' st' s' a = runSaxParser (k a) as' st' s' ir
     in p as st s f
 
--- instance MonadFail SaxParser where
---   fail s = SaxParser $ \_ _ _ _ _ _ -> Fail s
+instance MonadFail SaxParser where
+  fail s = SaxParser $ \_ _ _ _ -> Fail s
 
 parseSax :: SaxParser a -> SaxEvent -> SaxStream -> Result a
 parseSax (SaxParser p) as s = p as [] s (\_ _ _ a -> Done a)
-
--- eval
---   :: ((Transitions -> Transitions) -> Transitions)
---   -> SaxEvent
---   -> SaxStream
---   -> [TagState]
---   -> SaxParser a
---   -> (Result a)
--- eval kt acceptState s stack (SaxParser p) =
---   case S.next s of
---     Left _                    -> Fail "FIXME: stream exhausted"
---     Right (Right (event, s')) ->
---       let (mHead, stack') = safeHead stack
---       in if event == acceptState && Prelude.null stack'
---       then p kt acceptState s stack' Done
---       else let stack'' = transit (kt id) mHead stack' event
---         -- in parse transitions acceptState s' stack'' (SaxParser p)
---         in p kt acceptState s' stack'' (\i -> _)
 
 -- skipUntil :: SaxParser a -> SaxParser a
 -- skipUntil (SaxParser p) = SaxParser $ \as tr st s fk k ->
@@ -247,7 +151,7 @@ openTag tag = SaxParser $ \as st s k ->
            let
              newStack =
                if tagN == tag
-               then trans mHead Nothing (Just $ Open tag) poppedStack
+               then transit mHead Nothing (Push $ Open tag) poppedStack
                else poppedStack
            in trace "openTag: recursive parse" $ k (EndOfOpenTag tag) newStack s' ()
        _            -> Partial (\_ -> k event st s' ()) event s' st
@@ -269,7 +173,7 @@ endOfOpenTag tag = SaxParser $ \as st s k ->
            let
              newStack =
                if tagN == tag
-               then trans mHead (Just $ Open tag) (Just $ EndOfOpen tag) poppedStack
+               then transit mHead (Just $ Open tag) (Push $ EndOfOpen tag) poppedStack
                else poppedStack
            in trace "endOfOpenTag: recursive parse" $ k event newStack s' ()
        _            -> Partial (\_ -> k event st s' ()) event s' st
@@ -291,7 +195,7 @@ closeTag tag = SaxParser $ \as st s k ->
            let
              newStack =
                if tagN == tag
-               then trans mHead (Just $ EndOfOpen tag) Nothing poppedStack
+               then transit mHead (Just $ EndOfOpen tag) NoOp poppedStack
                else poppedStack
            in trace "closeTag: recursive parse" $ k event newStack s' ()
        _            -> Partial (\_ -> k event st s' ()) event s' st
@@ -321,42 +225,5 @@ closeTag tag = SaxParser $ \as st s k ->
 --   withTag "hello" $ do
 --     Hello <$> tagText
 
--- parseHello
---   :: forall m
---   . MonadError ParserException m
---   => ByteString
---   -> m Hello
--- parseHello str = eval automaton transition $ stream'
---   where
---     stream' :: Stream (Of SaxEvent) m ()
---     stream' = stream str
---     automaton :: Automaton (Hello Maybe)
---     automaton = Automaton Nothing [] acceptState (Hello Nothing)
---     acceptState = CloseTag "greeting"
---     transition :: SealedTransitions m (Hello Maybe)
---     transition = emptyTransitions
---       & addOpenK "hello" Nothing (const pure)
---       & addEndK "hello" Nothing (const pure)
---       & addTextK (Just (EndOfOpen "hello")) _
---       & addCloseK "hello" Nothing (const pure)
---       & sealTransitions
-
 helloXml :: ByteString
 helloXml = "<?xml version=\"1.1\"?><foo><hello><inner>Hello,</inner><world> world!</world></hello></foo>"
-
--- emptyTransitions :: Transitions m r
--- emptyTransitions = \openK attrK endK textK closeK cdataK event ms r ->
---   case event of
---     OpenTag s -> openK s ms r
---     Attr n s -> attrK n s ms r
---     EndOfOpenTag s -> endK s ms r
---     Text s -> textK s ms r
---     CloseTag s -> closeK s ms r
---     CDATA s -> cdataK s ms r
-
-checkStackHead :: Maybe TagState -> Maybe TagState -> Bool
-checkStackHead x = \y -> case x of
-  Nothing -> True
-  Just x' -> case y of
-    Nothing -> False
-    Just y' -> y' == x'
